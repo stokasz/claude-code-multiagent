@@ -1,0 +1,141 @@
+services:
+  # proxies claude code api calls to openrouter models
+  litellm:
+    build:
+      context: ./docker/litellm
+      dockerfile: Dockerfile
+
+    container_name: litellm-proxy
+
+    ports:
+      - "4000:4000"
+
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+
+    volumes:
+      - ./docker/litellm/config.yaml:/app/config.yaml:ro
+
+    restart: unless-stopped
+
+    networks:
+      - agent-network
+
+    healthcheck:
+      # checks all 4 models via openrouter, takes 10-15s
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+  claude-gemini:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+
+    container_name: claude-gemini
+
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=http://litellm:4000
+      - ANTHROPIC_MODEL=gemini
+
+    volumes:
+      - ${WORKTREE_GEMINI:-./test-workspace}:/workspace
+
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+    networks:
+      - agent-network
+
+    stdin_open: true
+    tty: true
+    command: tail -f /dev/null
+
+  claude-gpt5:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+
+    container_name: claude-gpt5
+
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=http://litellm:4000
+      - ANTHROPIC_MODEL=gpt5
+
+    volumes:
+      - ${WORKTREE_GPT5:-./test-workspace}:/workspace
+
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+    networks:
+      - agent-network
+
+    stdin_open: true
+    tty: true
+
+    command: tail -f /dev/null
+
+  claude-grok:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+
+    container_name: claude-grok
+
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=http://litellm:4000
+      - ANTHROPIC_MODEL=grok
+
+    volumes:
+      - ${WORKTREE_GROK:-./test-workspace}:/workspace
+
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+    networks:
+      - agent-network
+
+    stdin_open: true
+    tty: true
+
+    command: tail -f /dev/null
+
+  claude-qwen:
+    build:
+      context: ./docker/claude-code
+      dockerfile: Dockerfile
+
+    container_name: claude-qwen
+
+    environment:
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=http://litellm:4000
+      - ANTHROPIC_MODEL=qwen
+
+    volumes:
+      - ${WORKTREE_QWEN:-./test-workspace}:/workspace
+
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+    networks:
+      - agent-network
+
+    stdin_open: true
+    tty: true
+
+    command: tail -f /dev/null
+
+networks:
+  agent-network:
+    driver: bridge

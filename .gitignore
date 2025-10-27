@@ -1,0 +1,23 @@
+# environment variables (contains api keys)
+.env
+
+# docker override for local testing
+docker-compose.override.yml
+
+# test directories
+test-workspace/
+
+# macOS
+.DS_Store
+._*
+
+# ides
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# logs
+*.log

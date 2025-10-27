@@ -1,0 +1,511 @@
+#!/opt/homebrew/bin/bash
+
+# multi-agent development orchestrator
+# requires bash 4.0+ for associative arrays
+
+set -e
+
+# color codes for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# project directories
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+CONFIG_FILE="$PROJECT_DIR/docker/litellm/config.yaml"
+
+# read model names from config.yaml
+read_models_from_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log $RED "error: config file not found at $CONFIG_FILE"
+        exit 1
+    fi
+
+    # extract model_name values from yaml
+    grep "model_name:" "$CONFIG_FILE" | sed 's/.*model_name: *//' | sed 's/ *$//'
+}
+
+# load models into array
+MODELS=($(read_models_from_config))
+
+if [ ${#MODELS[@]} -eq 0 ]; then
+    log $RED "error: no models found in $CONFIG_FILE"
+    exit 1
+fi
+
+# colored log output
+log() {
+    local color=$1
+    shift
+    echo -e "${color}$@${NC}"
+}
+
+usage() {
+    echo "mad - multi-agent development"
+    echo ""
+    echo "usage: mad [command]"
+    echo ""
+    echo "commands:"
+    echo "  mad              start new session"
+    echo "  mad compare      compare implementations"
+    echo "  mad merge MODEL  merge model's work"
+    echo "  mad cleanup      remove worktrees and branches"
+    echo "  mad stop         stop containers and tmux"
+    echo ""
+    echo "examples:"
+    echo "  cd ~/my-project && mad"
+    echo "  mad compare"
+    echo "  mad merge gemini"
+    echo "  mad cleanup"
+    exit 0
+}
+
+COMMAND=${1:-start}
+
+case "$COMMAND" in
+    -h|--help|help)
+        usage
+        ;;
+
+    start)
+        # validate we're in a git repository
+        REPO_PATH=$(pwd)
+
+        if [ ! -d "$REPO_PATH/.git" ]; then
+            log $RED "error: not a git repository"
+            log $YELLOW "run 'git init' first"
+            exit 1
+        fi
+
+        # generate feature name from repo name + timestamp
+        REPO_NAME=$(basename "$REPO_PATH")
+        TIMESTAMP=$(date +%m%d-%H%M)
+        FEATURE_NAME="${REPO_NAME}-${TIMESTAMP}"
+
+        log $GREEN "starting session..."
+        log $BLUE "repo: $REPO_PATH"
+        log $BLUE "feature: $FEATURE_NAME"
+
+        cd "$REPO_PATH"
+
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        log $YELLOW "branch: $CURRENT_BRANCH"
+
+        # create branches and worktrees for each model
+        log $GREEN "\ncreating branches and worktrees..."
+
+        WORKTREE_BASE="$(dirname "$REPO_PATH")"
+        declare -A WORKTREE_PATHS
+
+        # create isolated git worktree for each model
+        for model in "${MODELS[@]}"; do
+            BRANCH_NAME="${FEATURE_NAME}-${model}"
+            WORKTREE_PATH="${WORKTREE_BASE}/${FEATURE_NAME}-${model}"
+
+            log $YELLOW "$model..."
+
+            if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+                log $YELLOW "  branch exists"
+            else
+                git branch "$BRANCH_NAME"
+                log $GREEN "  branch created"
+            fi
+
+            if [ -d "$WORKTREE_PATH" ]; then
+                log $YELLOW "  worktree exists"
+                EXISTING_BRANCH=$(cd "$WORKTREE_PATH" && git rev-parse --abbrev-ref HEAD)
+                if [ "$EXISTING_BRANCH" != "$BRANCH_NAME" ]; then
+                    log $RED "  error: wrong branch $EXISTING_BRANCH"
+                    exit 1
+                fi
+            else
+                git worktree add "$WORKTREE_PATH" "$BRANCH_NAME"
+                log $GREEN "  worktree created"
+            fi
+
+            WORKTREE_PATHS[$model]="$WORKTREE_PATH"
+        done
+
+        # export worktree paths as environment variables for docker-compose
+        log $GREEN "\nexporting vars..."
+        for model in "${MODELS[@]}"; do
+            # uppercase model name for env var
+            env_var="WORKTREE_${model^^}"
+            export "$env_var"="${WORKTREE_PATHS[$model]}"
+        done
+
+        cd "$PROJECT_DIR"
+
+        # run docker cleanup to free space
+        log $GREEN "\ndocker cleanup..."
+        "$SCRIPT_DIR/docker-cleanup" || log $YELLOW "cleanup skipped"
+        echo ""
+
+        # start docker containers
+        log $GREEN "starting containers..."
+        docker-compose up -d
+
+        # wait for containers to initialize
+        log $YELLOW "waiting for containers..."
+        sleep 3
+
+        # verify all containers started successfully
+        CONTAINERS_OK=true
+        for model in "${MODELS[@]}"; do
+            CONTAINER_NAME="claude-${model}"
+            if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+                log $RED "error: container $CONTAINER_NAME is not running"
+                CONTAINERS_OK=false
+            fi
+        done
+
+        if [ "$CONTAINERS_OK" != "true" ]; then
+            log $RED "containers failed. run 'docker-compose ps'"
+            exit 1
+        fi
+
+        # wait for litellm proxy to be healthy
+        if ! docker ps --format '{{.Names}}:{{.Status}}' | grep "litellm-proxy" | grep -q "healthy"; then
+            log $YELLOW "waiting for litellm..."
+            sleep 10
+        fi
+
+        log $GREEN "containers ready"
+
+        # create tmux session
+        SESSION_NAME="mad-${FEATURE_NAME}"
+
+        log $GREEN "\nlaunching tmux: $SESSION_NAME"
+
+        # kill existing session if it exists
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+        # create new session with panes for each model
+        tmux new-session -d -s "$SESSION_NAME" -n "agents"
+
+        # split window into panes (works for 4 models in 2x2 grid)
+        tmux split-window -h -t "$SESSION_NAME:0.0"
+        tmux split-window -v -t "$SESSION_NAME:0.0"
+        tmux split-window -v -t "$SESSION_NAME:0.1"
+
+        # start claude code in each pane
+        pane_index=0
+        for model in "${MODELS[@]}"; do
+            tmux send-keys -t "$SESSION_NAME:0.$pane_index" "TERM=xterm-256color docker exec -it claude-${model} bash" C-m
+            sleep 1
+            tmux send-keys -t "$SESSION_NAME:0.$pane_index" "cd /workspace && clear" C-m
+            pane_index=$((pane_index + 1))
+        done
+
+        # arrange panes in tiled layout
+        tmux select-layout -t "$SESSION_NAME:0" tiled
+        tmux select-pane -t "$SESSION_NAME:0.0"
+
+        # print session info
+        log $GREEN "\n========================================="
+        log $GREEN "session started"
+        log $GREEN "========================================="
+        echo ""
+        log $BLUE "session: $SESSION_NAME"
+        log $BLUE "feature: $FEATURE_NAME"
+        log $BLUE "models: ${MODELS[*]}"
+        echo ""
+        log $YELLOW "worktrees:"
+        for model in "${MODELS[@]}"; do
+            log $YELLOW "  ${model}: ${WORKTREE_PATHS[$model]}"
+        done
+        echo ""
+        log $GREEN "tmux:"
+        log $BLUE "  navigate: ctrl+b then arrows"
+        log $BLUE "  zoom: ctrl+b then z"
+        log $BLUE "  detach: ctrl+b then d"
+        log $BLUE "  reattach: tmux attach -t $SESSION_NAME"
+        echo ""
+        log $GREEN "next:"
+        log $BLUE "  mad compare"
+        log $BLUE "  mad merge MODEL"
+        log $BLUE "  mad cleanup"
+        echo ""
+        log $YELLOW "attaching in 3 seconds..."
+        sleep 3
+
+        tmux attach-session -t "$SESSION_NAME"
+        ;;
+
+    compare)
+        # find and compare all model implementations
+        log $GREEN "comparing implementations..."
+        echo ""
+
+        FEATURE_NAME=""
+        WORKTREES=()
+
+        # parse git worktree list to find model branches
+        while IFS= read -r line; do
+            if [[ $line =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+\[([^\]]+)\] ]]; then
+                worktree_path="${BASH_REMATCH[1]}"
+                branch="${BASH_REMATCH[3]}"
+
+                for model in "${MODELS[@]}"; do
+                    if [[ $branch =~ -${model}$ ]]; then
+                        if [ -z "$FEATURE_NAME" ]; then
+                            FEATURE_NAME="${branch%-${model}}"
+                        fi
+                        WORKTREES+=("$model:$worktree_path:$branch")
+                    fi
+                done
+            fi
+        done < <(git worktree list)
+
+        if [ ${#WORKTREES[@]} -eq 0 ]; then
+            log $RED "no worktrees found"
+            log $YELLOW "run 'mad' first"
+            exit 1
+        fi
+
+        log $BLUE "feature: $FEATURE_NAME"
+        log $BLUE "found ${#WORKTREES[@]} worktree(s)"
+        echo ""
+
+        for worktree_info in "${WORKTREES[@]}"; do
+            IFS=':' read -r model path branch <<< "$worktree_info"
+
+            log $CYAN "========================================="
+            log $CYAN "model: $model"
+            log $CYAN "branch: $branch"
+            log $CYAN "path: $path"
+            log $CYAN "========================================="
+
+            cd "$path"
+
+            log $YELLOW "\ngit status:"
+            git status --short
+
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            PARENT_BRANCH=$(git show-branch | grep '*' | grep -v "$CURRENT_BRANCH" | head -1 | sed 's/.*\[\(.*\)\].*/\1/' | sed 's/[\^~].*//')
+
+            if [ -n "$PARENT_BRANCH" ]; then
+                log $YELLOW "\nchanges vs $PARENT_BRANCH:"
+                git diff --stat "$PARENT_BRANCH"
+            fi
+
+            log $YELLOW "\nmodified files:"
+            git diff --name-only "$PARENT_BRANCH" 2>/dev/null | head -20 || echo "  (none)"
+
+            COMMIT_COUNT=$(git rev-list --count "$PARENT_BRANCH..$CURRENT_BRANCH" 2>/dev/null || echo "0")
+            log $BLUE "\ncommits: $COMMIT_COUNT"
+
+            echo ""
+        done
+
+        log $GREEN "========================================="
+        log $GREEN "summary"
+        log $GREEN "========================================="
+
+        for worktree_info in "${WORKTREES[@]}"; do
+            IFS=':' read -r model path branch <<< "$worktree_info"
+            cd "$path"
+
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            PARENT_BRANCH=$(git show-branch | grep '*' | grep -v "$CURRENT_BRANCH" | head -1 | sed 's/.*\[\(.*\)\].*/\1/' | sed 's/[\^~].*//')
+
+            CHANGES=$(git diff --shortstat "$PARENT_BRANCH" 2>/dev/null || echo "0 files changed")
+            COMMITS=$(git rev-list --count "$PARENT_BRANCH..$CURRENT_BRANCH" 2>/dev/null || echo "0")
+
+            log $BLUE "$model: $CHANGES, $COMMITS commits"
+        done
+        ;;
+
+    merge)
+        # merge a model's branch into current branch
+        MODEL=$2
+
+        # validate model argument
+        if [ -z "$MODEL" ]; then
+            log $RED "error: model required"
+            echo "usage: mad merge <model>"
+            echo "models: ${MODELS[*]}"
+            exit 1
+        fi
+
+        if [[ ! " ${MODELS[@]} " =~ " ${MODEL} " ]]; then
+            log $RED "error: invalid model '$MODEL'"
+            log $YELLOW "models: ${MODELS[*]}"
+            exit 1
+        fi
+
+        # find branch for specified model
+        BRANCH_NAME=""
+        while IFS= read -r branch; do
+            if [[ $branch =~ -${MODEL}$ ]]; then
+                BRANCH_NAME="$branch"
+                break
+            fi
+        done < <(git branch --format='%(refname:short)')
+
+        if [ -z "$BRANCH_NAME" ]; then
+            log $RED "error: no branch for '$MODEL'"
+            log $YELLOW "run 'mad' first"
+            exit 1
+        fi
+
+        FEATURE_NAME="${BRANCH_NAME%-${MODEL}}"
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+        log $GREEN "merging $MODEL..."
+        log $BLUE "from: $BRANCH_NAME"
+        log $BLUE "into: $CURRENT_BRANCH"
+        echo ""
+
+        # check for uncommitted changes
+        if ! git diff-index --quiet HEAD --; then
+            log $RED "error: uncommitted changes"
+            log $YELLOW "commit or stash first"
+            exit 1
+        fi
+
+        # perform merge
+        log $YELLOW "git merge $BRANCH_NAME"
+
+        if git merge "$BRANCH_NAME" --no-edit; then
+            log $GREEN "merge successful"
+            echo ""
+            log $BLUE "merged $BRANCH_NAME into $CURRENT_BRANCH"
+        else
+            log $RED "merge conflicts"
+            echo ""
+            log $YELLOW "resolve manually:"
+            log $BLUE "  git add <files>"
+            log $BLUE "  git commit"
+            exit 1
+        fi
+        ;;
+
+    cleanup|clean)
+        # remove all worktrees and branches for models
+        log $GREEN "cleaning up..."
+        echo ""
+
+        WORKTREES=()
+        # find all model worktrees
+        while IFS= read -r line; do
+            if [[ $line =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]+\[([^\]]+)\] ]]; then
+                worktree_path="${BASH_REMATCH[1]}"
+                branch="${BASH_REMATCH[3]}"
+
+                for model in "${MODELS[@]}"; do
+                    if [[ $branch =~ -${model}$ ]]; then
+                        WORKTREES+=("$model:$worktree_path:$branch")
+                    fi
+                done
+            fi
+        done < <(git worktree list)
+
+        if [ ${#WORKTREES[@]} -eq 0 ]; then
+            log $YELLOW "nothing to clean"
+            exit 0
+        fi
+
+        log $YELLOW "will delete all worktrees and branches"
+        log $BLUE "${#WORKTREES[@]} worktree(s):"
+        for worktree_info in "${WORKTREES[@]}"; do
+            IFS=':' read -r model path branch <<< "$worktree_info"
+            log $RED "  [delete] $model: $path"
+        done
+
+        echo ""
+        # confirm before deleting
+        read -p "continue? (y/n) " -n 1 -r
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log $YELLOW "cancelled"
+            exit 0
+        fi
+
+        # remove each worktree and branch
+        for worktree_info in "${WORKTREES[@]}"; do
+            IFS=':' read -r model path branch <<< "$worktree_info"
+
+            log $YELLOW "removing $model..."
+
+            if [ -d "$path" ]; then
+                git worktree remove "$path" --force
+                log $GREEN "  worktree removed"
+            fi
+
+            if git show-ref --verify --quiet "refs/heads/$branch"; then
+                git branch -D "$branch"
+                log $GREEN "  branch deleted"
+            fi
+        done
+
+        # cleanup stale worktree references
+        git worktree prune
+
+        echo ""
+        log $GREEN "done"
+        ;;
+
+    stop)
+        # stop all running mad sessions and containers
+        # preserves worktrees and branches for later comparison
+        log $GREEN "stopping session..."
+        echo ""
+
+        # find all mad-prefixed tmux sessions
+        TMUX_SESSIONS=$(tmux list-sessions 2>/dev/null | grep "^mad-" | cut -d: -f1 || true)
+
+        if [ -n "$TMUX_SESSIONS" ]; then
+            log $YELLOW "tmux sessions:"
+            echo "$TMUX_SESSIONS" | while read session; do
+                log $BLUE "  $session"
+            done
+            echo ""
+
+            # terminate each tmux session gracefully
+            echo "$TMUX_SESSIONS" | while read session; do
+                log $YELLOW "killing $session"
+                tmux kill-session -t "$session" 2>/dev/null || log $RED "failed: $session"
+            done
+            log $GREEN "tmux stopped"
+        else
+            log $BLUE "no tmux sessions"
+        fi
+
+        echo ""
+
+        cd "$PROJECT_DIR"
+
+        # stop docker containers to free resources
+        # containers can be restarted later without losing work
+        log $YELLOW "stopping containers..."
+        docker-compose stop
+        log $GREEN "containers stopped"
+
+        echo ""
+
+        # show remaining worktrees as reminder for user
+        if git rev-parse --git-dir >/dev/null 2>&1; then
+            log $BLUE "worktrees:"
+            git worktree list 2>/dev/null | grep -E -- "$(IFS=\|; echo "${MODELS[*]/#/-}")" || log $YELLOW "  none"
+        fi
+
+        echo ""
+        log $YELLOW "next:"
+        log $BLUE "  mad compare"
+        log $BLUE "  mad merge MODEL"
+        log $BLUE "  mad cleanup"
+        echo ""
+        log $GREEN "stopped"
+        ;;
+
+    *)
+        log $RED "unknown command: $COMMAND"
+        usage
+        ;;
+esac

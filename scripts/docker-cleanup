@@ -1,0 +1,177 @@
+#!/opt/homebrew/bin/bash
+
+# docker disk space cleanup utility
+# removes unused containers, images, volumes to free space
+# called automatically by mad script before starting sessions
+
+# color codes for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# colored log output
+log() {
+    local color=$1
+    shift
+    echo -e "${color}$@${NC}"
+}
+
+usage() {
+    echo "usage: $0 [options]"
+    echo ""
+    echo "options:"
+    echo "  --dry-run        preview only"
+    echo "  --aggressive     remove all unused images"
+    echo "  -h, --help       show help"
+    echo ""
+    echo "examples:"
+    echo "  $0"
+    echo "  $0 --dry-run"
+    echo "  $0 --aggressive"
+    exit 0
+}
+
+# default options
+DRY_RUN=false
+AGGRESSIVE=false
+
+# parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)
+            # preview what would be removed without deleting
+            DRY_RUN=true
+            shift
+            ;;
+        --aggressive)
+            # remove ALL unused images and build cache
+            # use with caution: rebuilds will be slower
+            AGGRESSIVE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            log $RED "unknown: $1"
+            usage
+            ;;
+    esac
+done
+
+if [ "$DRY_RUN" = true ]; then
+    log $YELLOW "dry run - no changes"
+    echo ""
+fi
+
+# show current disk usage before cleanup
+log $BLUE "disk usage:"
+docker system df
+echo ""
+
+TOTAL_BEFORE=$(docker system df --format "{{.Size}}" | head -1 || echo "0B")
+
+log $GREEN "cleaning up..."
+echo ""
+
+# remove stopped containers older than 24h
+# keeps recent containers for debugging
+log $YELLOW "stopped containers..."
+if [ "$DRY_RUN" = true ]; then
+    docker ps -a --filter "status=exited" --filter "status=created" --format "table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}" | head -20
+    STOPPED_COUNT=$(docker ps -a --filter "status=exited" --filter "status=created" -q | wc -l | tr -d ' ')
+    log $BLUE "would remove $STOPPED_COUNT"
+else
+    REMOVED=$(docker container prune -f --filter "until=24h" 2>&1)
+    if echo "$REMOVED" | grep -q "Total reclaimed space"; then
+        log $GREEN "  $REMOVED"
+    else
+        log $BLUE "  none"
+    fi
+fi
+echo ""
+
+# remove dangling images (untagged intermediate layers)
+# safe to remove: these are build artifacts with no purpose
+log $YELLOW "dangling images..."
+if [ "$DRY_RUN" = true ]; then
+    docker images --filter "dangling=true" --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}" | head -20
+    DANGLING_COUNT=$(docker images --filter "dangling=true" -q | wc -l | tr -d ' ')
+    log $BLUE "would remove $DANGLING_COUNT"
+else
+    REMOVED=$(docker image prune -f 2>&1)
+    if echo "$REMOVED" | grep -q "Total reclaimed space"; then
+        log $GREEN "  $REMOVED"
+    else
+        log $BLUE "  none"
+    fi
+fi
+echo ""
+
+# remove volumes not attached to any container
+# frees significant disk space from deleted containers
+log $YELLOW "unused volumes..."
+if [ "$DRY_RUN" = true ]; then
+    docker volume ls --filter "dangling=true" --format "table {{.Name}}\t{{.Driver}}" | head -20
+    VOLUME_COUNT=$(docker volume ls --filter "dangling=true" -q | wc -l | tr -d ' ')
+    log $BLUE "would remove $VOLUME_COUNT"
+else
+    REMOVED=$(docker volume prune -f 2>&1)
+    if echo "$REMOVED" | grep -q "Total reclaimed space"; then
+        log $GREEN "  $REMOVED"
+    else
+        log $BLUE "  none"
+    fi
+fi
+echo ""
+
+# aggressive mode: remove ALL unused images
+# warning: next docker-compose build will redownload everything
+if [ "$AGGRESSIVE" = true ]; then
+    log $YELLOW "all unused images..."
+    if [ "$DRY_RUN" = true ]; then
+        docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}" | head -20
+        UNUSED_COUNT=$(docker images -q | wc -l | tr -d ' ')
+        log $BLUE "would remove $UNUSED_COUNT"
+    else
+        REMOVED=$(docker image prune -a -f 2>&1)
+        if echo "$REMOVED" | grep -q "Total reclaimed space"; then
+            log $GREEN "  $REMOVED"
+        else
+            log $BLUE "  none"
+        fi
+    fi
+    echo ""
+fi
+
+# aggressive mode: clear build cache
+# frees space but slows down next build significantly
+if [ "$AGGRESSIVE" = true ]; then
+    log $YELLOW "build cache..."
+    if [ "$DRY_RUN" = true ]; then
+        docker buildx du 2>/dev/null || docker system df -v | grep -A 20 "Build Cache"
+        log $BLUE "would remove build cache"
+    else
+        REMOVED=$(docker builder prune -f 2>&1)
+        if echo "$REMOVED" | grep -q "Total reclaimed space"; then
+            log $GREEN "  $REMOVED"
+        else
+            log $BLUE "  none"
+        fi
+    fi
+    echo ""
+fi
+
+# show results of cleanup
+if [ "$DRY_RUN" = false ]; then
+    log $BLUE "disk usage after cleanup:"
+    docker system df
+    echo ""
+
+    log $GREEN "done"
+else
+    log $YELLOW "dry run complete"
+    log $BLUE "run without --dry-run to clean"
+fi
