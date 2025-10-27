@@ -1,4 +1,4 @@
-# Claude Code Multi-Agent Development
+# Claude Code Multi-Agent Development (MAD)
 
 <img width="3234" height="1904" alt="image_2025-10-27_15-05-35" src="https://github.com/user-attachments/assets/fbd8419e-8632-47d8-a0e5-143b2a7602c5" />
 
