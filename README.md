@@ -1,4 +1,6 @@
-# mad: multi-agent development for claude code
+# Multi-agent development for Claude Code
+
+<img width="3234" height="1904" alt="image_2025-10-27_15-05-35" src="https://github.com/user-attachments/assets/fbd8419e-8632-47d8-a0e5-143b2a7602c5" />
 
 Run Claude Code on different AI models (Grok, Gemini, GPT or any from 500+ on OpenRouter) in parallel. each in its own container, its own branch. compare. merge the best.
 
