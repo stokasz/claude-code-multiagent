@@ -10,7 +10,7 @@ You can also use this tool to set up Claude Code with any free model available v
 
 Get multiple models to work on the same problem, so you can merge the one with the best results. It's like being a game master for a battle royale, where each model is a contestant and you pick the winner.
 
-I found tooling like Claude Code Router or Claude Code Proxy to be either missing parallel execution w/ containers.
+I found tooling like Claude Code Router or Claude Code Proxy to be missing parallel execution w/ containers.
 
 **How it works:**
 
