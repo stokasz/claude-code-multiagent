@@ -1,33 +1,30 @@
-# Multi-agent development for Claude Code
+# Claude Code Multi-Agent Development
 
 <img width="3234" height="1904" alt="image_2025-10-27_15-05-35" src="https://github.com/user-attachments/assets/fbd8419e-8632-47d8-a0e5-143b2a7602c5" />
 
-Run Claude Code on different AI models (Grok, Gemini, GPT or any from 500+ on OpenRouter) in parallel. each in its own container, its own branch. compare. merge the best.
+Run Claude Code on different AI models (Grok, Gemini, GPT or any from 500+ on OpenRouter) in parallel. Each Claude Code instance creates a separate branch from your current one, and runs in a different Docker container. 
 
-never wonder "would another model have done better?"
+You can also use this tool to set up Claude Code with any free model available via OpenRouter's API, and use Claude Code for free!
 
-## why this matters
+## Why Multi-Agent?
 
-when you ask an AI to build something, you get one approach. but what if gpt-5 would have made better architectural choices? what if gemini handles edge cases you didn't think of?
+Get multiple models to work on the same problem, so you can merge the one with the best results. It's like being a game master for a battle royale, where each model is a contestant and you pick the winner.
 
-mad runs them in parallel. same task, different models, isolated environments. you see all approaches, pick the winner. it's like being a game master for a battle royale, where each model is a contestant and you pick the winner.
+I found tooling like Claude Code Router or Claude Code Proxy to be either missing parallel execution w/ containers.
 
-i found tooling like Claude Code Router or Claude Code Proxy to be either missing parallel execution w/ containers, or too complex to set up.
+**How it works:**
 
-ps. you can use this to run Claude Code for free with OpenRouter's free models like Deepseek.
+- Choose any 4 models from OpenRouter's 500+ options
+- Run 4 models in parallel (you pick which 4)
+- Each runs Claude Code in a separate docker container
+- Each works on a separate git branch via worktrees
+- Watch them all in tmux 2x2 grid
+- Compare implementations with `mad compare`
+- Merge the best one with `mad merge <model>`
 
-**how it works:**
+*currently only macOS supported (sorry windows guys) / porting to linux is trivial
 
-- choose any 4 models from openrouter's 500+ options
-- run 4 models in parallel (you pick which 4)
-- each runs Claude Code in a separate docker container
-- each works on a separate git branch via worktrees
-- watch them all in tmux 2x2 grid
-- compare implementations with `mad compare`
-- merge the best one with `mad merge <model>`
-- currently only macOS supported (sorry windows guys) / porting to linux is trivial
-
-## setup
+## Setup
 
 ```bash
 # install docker desktop from docker.com/products/docker-desktop
@@ -48,24 +45,19 @@ echo 'export PATH="$PATH:'$(pwd)'/scripts"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-## usage
+## Usage
 
 ```bash
 cd ~/your-project
 mad
 ```
-
-that's it. creates branches, starts containers, opens tmux with 4 panes. each pane runs Claude Code with a different model.
-
-give the same prompt to all 4 and you can relax while clankers work.
-
 ```bash
 mad compare      # see what each model built
 mad merge gemini # merge the best one
 mad cleanup      # remove branches/worktrees
 ```
 
-## workflow
+## Workflow
 
 ```bash
 cd ~/my-project
@@ -84,7 +76,7 @@ mad merge gpt5
 mad cleanup
 ```
 
-## commands
+## Commands
 
 | command             | what it does                      |
 | ------------------- | --------------------------------- |
@@ -94,7 +86,7 @@ mad cleanup
 | `mad cleanup`       | remove all worktrees and branches |
 | `mad stop`          | stop containers and tmux          |
 
-## changing models
+## Changing models
 
 edit `docker/litellm/config.yaml`:
 
@@ -117,7 +109,7 @@ docker-compose build
 docker-compose up -d
 ```
 
-## troubleshooting
+## Troubleshooting
 
 **containers won't start:** `docker-compose ps` and `docker-compose logs litellm`. rebuild with `docker-compose down && docker-compose build --no-cache && docker-compose up -d`.
 
@@ -127,6 +119,7 @@ docker-compose up -d
 
 **disk space:** `./scripts/docker-cleanup` to remove old containers/images.
 
-## how it works
-
-git worktrees give you real filesystem isolation while sharing .git (makes diffs trivial). litellm proxies requests to any model. tmux shows all 4 agents side-by-side.
+## Future ideas
+- Auto pick the model from the list of OpenRouter models
+- MCP/API/headless project management system to let agents collaborate despite separated branches
+- Launch more than 4 models at the same time (I am not sure how needed this is with Claude Code's subagents)
